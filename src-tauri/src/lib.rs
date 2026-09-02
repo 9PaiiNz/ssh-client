@@ -4,9 +4,7 @@ mod ssh;
 
 use std::sync::Arc;
 
-use models::{
-    ConnectParams, ConnectionProfile, PortForwardRule, SftpEntry, TransferProgress,
-};
+use models::{ConnectParams, ConnectionProfile, PortForwardRule, SftpEntry};
 use profiles::ProfileStore;
 use ssh::SessionManager;
 use tauri::Manager;

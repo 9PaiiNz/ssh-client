@@ -1,16 +1,18 @@
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use parking_lot::Mutex as ParkingMutex;
 use russh::client;
-use russh::{Channel, ChannelMsg, DisconnectReason};
+use russh::{Channel, ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession as RusshSftpSession;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener as TokioTcpListener;
 use tokio::net::TcpStream as TokioTcpStream;
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 use crate::models::{
@@ -22,10 +24,11 @@ use crate::ssh::client::{
 };
 
 struct SessionInner {
-    handle: client::Handle<SshClientHandler>,
-    channel: Channel<client::Msg>,
+    handle: Arc<Mutex<client::Handle<SshClientHandler>>>,
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    resize_tx: mpsc::UnboundedSender<(u32, u32)>,
     sftp: Mutex<Option<RusshSftpSession>>,
-    port_forwards: Mutex<Vec<PortForwardHandle>>,
+    port_forwards: ParkingMutex<Vec<PortForwardHandle>>,
     cancel: tokio::sync::watch::Sender<bool>,
 }
 
@@ -55,10 +58,8 @@ impl SessionManager {
             ..Default::default()
         });
 
-        let handler = SshClientHandler;
-
         let addr = format!("{}:{}", params.host, params.port);
-        let mut handle = client::connect(config, &addr, handler)
+        let mut handle = client::connect(config, &addr, SshClientHandler)
             .await
             .context("failed to connect to SSH server")?;
 
@@ -78,7 +79,7 @@ impl SessionManager {
             .await?;
         }
 
-        let mut channel = handle
+        let channel = handle
             .channel_open_session()
             .await
             .context("failed to open session channel")?;
@@ -94,12 +95,17 @@ impl SessionManager {
             .context("failed to request shell")?;
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u32, u32)>();
+
+        let handle = Arc::new(Mutex::new(handle));
 
         let inner = Arc::new(SessionInner {
-            handle,
-            channel,
+            handle: handle.clone(),
+            write_tx,
+            resize_tx,
             sftp: Mutex::new(None),
-            port_forwards: Mutex::new(Vec::new()),
+            port_forwards: ParkingMutex::new(Vec::new()),
             cancel: cancel_tx,
         });
 
@@ -108,7 +114,7 @@ impl SessionManager {
         let app = self.app.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
-            read_loop(app, sid, inner, cancel_rx).await;
+            shell_loop(app, sid, channel, write_rx, resize_rx, cancel_rx).await;
         });
 
         Ok(session_id)
@@ -120,9 +126,10 @@ impl SessionManager {
             for pf in inner.port_forwards.lock().drain(..) {
                 pf.task.abort();
             }
-            let _ = inner.channel.eof().await;
-            let _ = inner.channel.close().await;
-            let _ = inner.handle.disconnect(DisconnectReason::ByApplication, "", "en").await;
+            let handle = inner.handle.lock().await;
+            let _ = handle
+                .disconnect(Disconnect::ByApplication, "closed by user", "en")
+                .await;
         }
         Ok(())
     }
@@ -133,10 +140,9 @@ impl SessionManager {
             .get(session_id)
             .ok_or_else(|| anyhow!("session not found"))?;
         inner
-            .channel
-            .data(data.as_bytes())
-            .await
-            .context("failed to write to terminal")?;
+            .write_tx
+            .send(data.as_bytes().to_vec())
+            .map_err(|_| anyhow!("session channel closed"))?;
         Ok(())
     }
 
@@ -146,31 +152,30 @@ impl SessionManager {
             .get(session_id)
             .ok_or_else(|| anyhow!("session not found"))?;
         inner
-            .channel
-            .window_change(cols, rows, 0, 0)
-            .await
-            .context("failed to resize terminal")?;
+            .resize_tx
+            .send((cols, rows))
+            .map_err(|_| anyhow!("session channel closed"))?;
         Ok(())
     }
 
-    async fn get_sftp(&self, session_id: &str) -> Result<RusshSftpSession> {
+    async fn ensure_sftp(&self, session_id: &str) -> Result<Arc<SessionInner>> {
         let inner = self
             .sessions
             .get(session_id)
+            .map(|e| e.clone())
             .ok_or_else(|| anyhow!("session not found"))?;
 
-        {
-            let guard = inner.sftp.lock();
-            if let Some(sftp) = guard.as_ref() {
-                return Ok(sftp.clone());
-            }
+        if inner.sftp.lock().await.is_some() {
+            return Ok(inner);
         }
 
-        let mut channel = inner
-            .handle
-            .channel_open_session()
-            .await
-            .context("failed to open SFTP channel")?;
+        let channel = {
+            let handle = inner.handle.lock().await;
+            handle
+                .channel_open_session()
+                .await
+                .context("failed to open SFTP channel")?
+        };
 
         channel
             .request_subsystem(true, "sftp")
@@ -181,29 +186,26 @@ impl SessionManager {
             .await
             .context("failed to init SFTP")?;
 
-        *inner.sftp.lock() = Some(sftp.clone());
-        Ok(sftp)
+        *inner.sftp.lock().await = Some(sftp);
+        Ok(inner)
     }
 
     pub async fn list_sftp_dir(&self, session_id: &str, path: &str) -> Result<Vec<SftpEntry>> {
-        let sftp = self.get_sftp(session_id).await?;
+        let inner = self.ensure_sftp(session_id).await?;
+        let sftp = inner.sftp.lock().await;
+        let sftp = sftp.as_ref().ok_or_else(|| anyhow!("SFTP unavailable"))?;
         let read_dir = sftp.read_dir(path).await.context("failed to read dir")?;
 
         let mut entries = Vec::new();
         for entry in read_dir {
             let name = entry.file_name();
-            let entry_path = if path.ends_with('/') {
-                format!("{}{}", path, name)
-            } else if path == "/" {
-                format!("/{}", name)
-            } else {
-                format!("{}/{}", path, name)
-            };
-
-            let attrs = entry.metadata().await.unwrap_or_default();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let attrs = entry.metadata();
             entries.push(SftpEntry {
-                name: name.to_string(),
-                path: entry_path,
+                name,
+                path: entry.path(),
                 is_dir: attrs.is_dir(),
                 size: attrs.size.unwrap_or(0),
                 modified: attrs.mtime.unwrap_or(0) as u64,
@@ -222,12 +224,15 @@ impl SessionManager {
     ) -> Result<String> {
         let transfer_id = Uuid::new_v4().to_string();
         let file_name = remote_path
-            .split('/')
-            .last()
+            .rsplit('/')
+            .next()
             .unwrap_or("file")
             .to_string();
 
-        let sftp = self.get_sftp(session_id).await?;
+        let inner = self.ensure_sftp(session_id).await?;
+        let sftp = inner.sftp.lock().await;
+        let sftp = sftp.as_ref().ok_or_else(|| anyhow!("SFTP unavailable"))?;
+
         let metadata = sftp
             .metadata(remote_path)
             .await
@@ -296,8 +301,8 @@ impl SessionManager {
     ) -> Result<String> {
         let transfer_id = Uuid::new_v4().to_string();
         let file_name = local_path
-            .split(['/', '\\'])
-            .last()
+            .rsplit(['/', '\\'])
+            .next()
             .unwrap_or("file")
             .to_string();
 
@@ -317,7 +322,10 @@ impl SessionManager {
             error: None,
         });
 
-        let sftp = self.get_sftp(session_id).await?;
+        let inner = self.ensure_sftp(session_id).await?;
+        let sftp = inner.sftp.lock().await;
+        let sftp = sftp.as_ref().ok_or_else(|| anyhow!("SFTP unavailable"))?;
+
         let mut local = tokio::fs::File::open(local_path)
             .await
             .context("failed to open local file")?;
@@ -373,6 +381,7 @@ impl SessionManager {
         let inner = self
             .sessions
             .get(session_id)
+            .map(|e| e.clone())
             .ok_or_else(|| anyhow!("session not found"))?;
 
         let rule = PortForwardRule {
@@ -387,14 +396,21 @@ impl SessionManager {
 
         let handle = inner.handle.clone();
         let rule_clone = rule.clone();
+        let mut cancel_rx = inner.cancel.subscribe();
 
         let task = match forward_type {
             "local" => {
                 let bind_addr = format!("{}:{}", bind_host, bind_port);
                 let target_host = target_host.to_string();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        run_local_forward(handle, bind_addr, target_host, target_port).await
+                    if let Err(e) = run_local_forward(
+                        handle,
+                        bind_addr,
+                        target_host,
+                        target_port,
+                        &mut cancel_rx,
+                    )
+                    .await
                     {
                         tracing::error!("local forward error: {e}");
                     }
@@ -402,16 +418,9 @@ impl SessionManager {
             }
             "remote" => {
                 let bind_host = bind_host.to_string();
-                let target_host = target_host.to_string();
                 tokio::spawn(async move {
-                    if let Err(e) = run_remote_forward(
-                        handle,
-                        bind_host,
-                        bind_port,
-                        target_host,
-                        target_port,
-                    )
-                    .await
+                    if let Err(e) =
+                        run_remote_forward(handle, bind_host, bind_port, &mut cancel_rx).await
                     {
                         tracing::error!("remote forward error: {e}");
                     }
@@ -421,7 +430,7 @@ impl SessionManager {
         };
 
         inner.port_forwards.lock().push(PortForwardHandle {
-            rule: rule_clone.clone(),
+            rule: rule_clone,
             task,
         });
 
@@ -457,10 +466,12 @@ impl SessionManager {
     }
 }
 
-async fn read_loop(
+async fn shell_loop(
     app: AppHandle,
     session_id: String,
-    inner: Arc<SessionInner>,
+    mut channel: Channel<client::Msg>,
+    mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut resize_rx: mpsc::UnboundedReceiver<(u32, u32)>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -468,123 +479,132 @@ async fn read_loop(
             break;
         }
 
-        let msg = tokio::select! {
+        tokio::select! {
             _ = cancel.changed() => {
-                if *cancel.borrow() { break; }
-                continue;
+                if *cancel.borrow() {
+                    break;
+                }
             }
-            msg = inner.channel.wait() => msg,
-        };
-
-        match msg {
-            Some(ChannelMsg::Data { data }) => {
-                let text = String::from_utf8_lossy(&data).to_string();
-                let _ = app.emit(&format!("terminal-output:{}", session_id), text);
+            Some(data) = write_rx.recv() => {
+                if channel.data(&data[..]).await.is_err() {
+                    break;
+                }
             }
-            Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::Eof) | None => {
-                let _ = app.emit(
-                    &format!("session-status:{}", session_id),
-                    SessionStatusEvent {
-                        status: "disconnected".to_string(),
-                        error: None,
-                    },
-                );
-                break;
+            Some((cols, rows)) = resize_rx.recv() => {
+                let _ = channel.window_change(cols, rows, 0, 0).await;
             }
-            Some(other) => {
-                if let Some(data) = decode_channel_data(other) {
-                    let text = String::from_utf8_lossy(&data).to_string();
-                    let _ = app.emit(&format!("terminal-output:{}", session_id), text);
+            msg = channel.wait() => {
+                match msg {
+                    Some(ChannelMsg::Data { data }) => {
+                        let text = String::from_utf8_lossy(&data).to_string();
+                        let _ = app.emit(&format!("terminal-output:{}", session_id), text);
+                    }
+                    Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::Eof) | None => {
+                        let _ = app.emit(
+                            &format!("session-status:{}", session_id),
+                            SessionStatusEvent {
+                                status: "disconnected".to_string(),
+                                error: None,
+                            },
+                        );
+                        break;
+                    }
+                    Some(other) => {
+                        if let Some(data) = decode_channel_data(other) {
+                            let text = String::from_utf8_lossy(&data).to_string();
+                            let _ = app.emit(&format!("terminal-output:{}", session_id), text);
+                        }
+                    }
                 }
             }
         }
     }
+
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
 }
 
 async fn run_local_forward(
-    handle: client::Handle<SshClientHandler>,
+    handle: Arc<Mutex<client::Handle<SshClientHandler>>>,
     bind_addr: String,
     target_host: String,
     target_port: u16,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(&bind_addr).context("failed to bind local port")?;
-    listener.set_nonblocking(true)?;
+    let std_listener = TcpListener::bind(&bind_addr).context("failed to bind local port")?;
+    std_listener.set_nonblocking(true)?;
+    let listener = TokioTcpListener::from_std(std_listener)?;
 
     loop {
-        let (stream, _) = tokio::task::spawn_blocking({
-            let listener = listener.try_clone()?;
-            move || listener.accept()
-        })
-        .await??;
-
-        let handle = handle.clone();
-        let target_host = target_host.clone();
-        tokio::spawn(async move {
-            let _ = pipe_local_connection(handle, stream, target_host, target_port).await;
-        });
-    }
-}
-
-async fn pipe_local_connection(
-    handle: client::Handle<SshClientHandler>,
-    local: TcpStream,
-    target_host: String,
-    target_port: u16,
-) -> Result<()> {
-    let mut channel = handle
-        .channel_open_direct_tcpip(&target_host, target_port as u32, "127.0.0.1", 0)
-        .await?;
-
-    let mut local = TokioTcpStream::from_std(local)?;
-
-    let (mut lr, mut lw) = local.split();
-    let mut channel_stream = channel.into_stream();
-
-    let c2l = async {
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let n = channel_stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
+        tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    break;
+                }
             }
-            lw.write_all(&buf[..n]).await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let l2c = async {
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let n = lr.read(&mut buf).await?;
-            if n == 0 {
-                break;
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("accept failed")?;
+                let handle = handle.clone();
+                let target_host = target_host.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pipe_local_connection(handle, stream, target_host, target_port).await {
+                        tracing::debug!("forward connection closed: {e}");
+                    }
+                });
             }
-            channel_stream.write_all(&buf[..n]).await?;
         }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    tokio::select! {
-        r = c2l => r?,
-        r = l2c => r?,
     }
 
     Ok(())
 }
 
+async fn pipe_local_connection(
+    handle: Arc<Mutex<client::Handle<SshClientHandler>>>,
+    mut local: TokioTcpStream,
+    target_host: String,
+    target_port: u16,
+) -> Result<()> {
+    let channel = {
+        let handle = handle.lock().await;
+        handle
+            .channel_open_direct_tcpip(&target_host, target_port as u32, "127.0.0.1", 0)
+            .await
+            .context("failed to open direct-tcpip channel")?
+    };
+
+    let mut remote = channel.into_stream();
+    tokio::io::copy_bidirectional(&mut local, &mut remote)
+        .await
+        .context("forward pipe failed")?;
+    Ok(())
+}
+
 async fn run_remote_forward(
-    handle: client::Handle<SshClientHandler>,
+    handle: Arc<Mutex<client::Handle<SshClientHandler>>>,
     bind_host: String,
     bind_port: u16,
-    _target_host: String,
-    _target_port: u16,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    handle
-        .tcpip_forward(&bind_host, bind_port as u32)
-        .await
-        .context("failed to request remote forward")?;
+    {
+        let mut handle = handle.lock().await;
+        handle
+            .tcpip_forward(&bind_host, bind_port as u32)
+            .await
+            .context("failed to request remote forward")?;
+    }
 
     loop {
-        tokio::time::sleep(Duration::from_secs(3600)).await;
+        tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
     }
+
+    let handle = handle.lock().await;
+    let _ = handle.cancel_tcpip_forward(&bind_host, bind_port as u32).await;
+    Ok(())
 }

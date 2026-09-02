@@ -3,7 +3,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use russh::client;
 use russh::ChannelMsg;
-use russh_keys::key::PrivateKeyWithHashAlg;
 
 pub struct SshClientHandler;
 
@@ -15,6 +14,7 @@ impl client::Handler for SshClientHandler {
         &mut self,
         _server_public_key: &russh_keys::key::PublicKey,
     ) -> Result<bool, Self::Error> {
+        // Accept all host keys in v1; TOFU UI can be added later.
         Ok(true)
     }
 }
@@ -31,7 +31,7 @@ pub fn load_private_key(
     path: &str,
     passphrase: Option<&str>,
 ) -> anyhow::Result<russh_keys::key::KeyPair> {
-    let expanded = if path.starts_with("~/") {
+    let expanded = if path.starts_with("~/") || path.starts_with("~\\") {
         if let Some(home) = dirs::home_dir() {
             home.join(&path[2..]).to_string_lossy().to_string()
         } else {
@@ -40,8 +40,7 @@ pub fn load_private_key(
     } else {
         path.to_string()
     };
-    let key = russh_keys::load_secret_key(&expanded, passphrase)?;
-    Ok(key)
+    Ok(russh_keys::load_secret_key(&expanded, passphrase)?)
 }
 
 pub async fn authenticate_with_key(
@@ -49,17 +48,10 @@ pub async fn authenticate_with_key(
     username: &str,
     key: russh_keys::key::KeyPair,
 ) -> anyhow::Result<()> {
-    let auth_res = handle
-        .authenticate_publickey(
-            username,
-            PrivateKeyWithHashAlg::new(
-                Arc::new(key),
-                handle.best_supported_rsa_hash().await?.flatten(),
-            ),
-        )
+    let ok = handle
+        .authenticate_publickey(username, Arc::new(key))
         .await?;
-
-    if !auth_res.success() {
+    if !ok {
         anyhow::bail!("key authentication rejected");
     }
     Ok(())
@@ -70,11 +62,8 @@ pub async fn authenticate_with_password(
     username: &str,
     password: &str,
 ) -> anyhow::Result<()> {
-    let auth_res = handle
-        .authenticate_password(username, password)
-        .await?;
-
-    if !auth_res.success() {
+    let ok = handle.authenticate_password(username, password).await?;
+    if !ok {
         anyhow::bail!("password authentication rejected");
     }
     Ok(())
