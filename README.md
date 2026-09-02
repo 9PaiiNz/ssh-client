@@ -26,6 +26,22 @@ A modern, clean cross-platform SSH client built with Tauri 2 and React. Terminal
   - **Windows:** Microsoft C++ Build Tools (Visual Studio Build Tools with the "Desktop development with C++" workload)
   - **Linux:** `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `patchelf`, `build-essential`
 
+## Downloads
+
+Prebuilt binaries are published on the [Releases](https://github.com/9PaiiNz/ssh-client/releases) page:
+
+- **Windows:** `.exe` installer (NSIS)
+- **Linux:** `.AppImage` (run `chmod +x *.AppImage` after download)
+
+To cut a new release, push a version tag:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+GitHub Actions builds Windows + Linux and attaches the installers to the release.
+
 ## Getting Started
 
 ```bash
