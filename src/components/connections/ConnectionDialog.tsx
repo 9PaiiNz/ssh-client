@@ -29,6 +29,14 @@ const emptyProfile = (): ConnectionProfile => ({
   auth: { type: "password", password: "" },
 });
 
+function passwordAuth(password = ""): ConnectionProfile["auth"] {
+  return { type: "password", password };
+}
+
+function keyAuth(keyPath = "", keyPassphrase = ""): ConnectionProfile["auth"] {
+  return { type: "key", keyPath, keyPassphrase };
+}
+
 export function ConnectionDialog({
   open: isOpen,
   onOpenChange,
@@ -51,19 +59,27 @@ export function ConnectionDialog({
     setProfile((p) => ({ ...p, ...partial }));
 
   const handlePickKey = async () => {
+    // No extension filter — Tauri/rfd cannot show extensionless files (id_rsa, id_ed25519).
     const selected = await open({
       multiple: false,
-      filters: [{ name: "SSH Key", extensions: ["pem", "key", "pub", ""] }],
+      title: "Select SSH private key",
     });
     if (selected && typeof selected === "string") {
-      update({
-        auth: { ...profile.auth, type: "key", keyPath: selected },
-      });
+      setProfile((p) => ({
+        ...p,
+        auth: keyAuth(
+          selected,
+          p.auth.type === "key" ? (p.auth.keyPassphrase ?? "") : ""
+        ),
+      }));
     }
   };
 
   const handleSave = async (andConnect: boolean) => {
     if (!profile.name || !profile.host || !profile.username) return;
+    if (profile.auth.type === "key" && !profile.auth.keyPath?.trim()) {
+      return;
+    }
     setSaving(true);
     try {
       await addOrUpdateProfile(profile);
@@ -158,7 +174,13 @@ export function ConnectionDialog({
                 variant={profile.auth.type === "password" ? "default" : "secondary"}
                 size="sm"
                 onClick={() =>
-                  update({ auth: { type: "password", password: "" } })
+                  update({
+                    auth: passwordAuth(
+                      profile.auth.type === "password"
+                        ? (profile.auth.password ?? "")
+                        : ""
+                    ),
+                  })
                 }
               >
                 Password
@@ -168,7 +190,16 @@ export function ConnectionDialog({
                 variant={profile.auth.type === "key" ? "default" : "secondary"}
                 size="sm"
                 onClick={() =>
-                  update({ auth: { type: "key", keyPath: "" } })
+                  update({
+                    auth: keyAuth(
+                      profile.auth.type === "key"
+                        ? (profile.auth.keyPath ?? "")
+                        : "",
+                      profile.auth.type === "key"
+                        ? (profile.auth.keyPassphrase ?? "")
+                        : ""
+                    ),
+                  })
                 }
               >
                 SSH Key
@@ -185,7 +216,7 @@ export function ConnectionDialog({
                 value={profile.auth.password ?? ""}
                 onChange={(e) =>
                   update({
-                    auth: { ...profile.auth, password: e.target.value },
+                    auth: passwordAuth(e.target.value),
                   })
                 }
               />
@@ -199,7 +230,12 @@ export function ConnectionDialog({
                     value={profile.auth.keyPath ?? ""}
                     onChange={(e) =>
                       update({
-                        auth: { ...profile.auth, keyPath: e.target.value },
+                        auth: keyAuth(
+                          e.target.value,
+                          profile.auth.type === "key"
+                            ? (profile.auth.keyPassphrase ?? "")
+                            : ""
+                        ),
                       })
                     }
                     placeholder="~/.ssh/id_rsa"
@@ -209,6 +245,9 @@ export function ConnectionDialog({
                     Browse
                   </Button>
                 </div>
+                <p className="text-[11px] text-muted">
+                  Supports id_rsa, id_ed25519, .pem, and other OpenSSH private keys.
+                </p>
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="passphrase">Key Passphrase (optional)</Label>
@@ -218,10 +257,12 @@ export function ConnectionDialog({
                   value={profile.auth.keyPassphrase ?? ""}
                   onChange={(e) =>
                     update({
-                      auth: {
-                        ...profile.auth,
-                        keyPassphrase: e.target.value,
-                      },
+                      auth: keyAuth(
+                        profile.auth.type === "key"
+                          ? (profile.auth.keyPath ?? "")
+                          : "",
+                        e.target.value
+                      ),
                     })
                   }
                 />

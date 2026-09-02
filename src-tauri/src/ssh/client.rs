@@ -40,6 +40,9 @@ pub fn load_private_key(
     } else {
         path.to_string()
     };
+    // Empty string must be treated as None — passing Some("") to an
+    // unencrypted key makes ssh-key return "private key is already decrypted".
+    let passphrase = passphrase.map(str::trim).filter(|p| !p.is_empty());
     Ok(russh_keys::load_secret_key(&expanded, passphrase)?)
 }
 

@@ -67,6 +67,8 @@ impl SessionManager {
             let key_path = params
                 .key_path
                 .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
                 .ok_or_else(|| anyhow!("key path required"))?;
             let key = load_private_key(key_path, params.key_passphrase.as_deref())?;
             authenticate_with_key(&mut handle, &params.username, key).await?;
