@@ -33,6 +33,8 @@ Prebuilt binaries are published on the [Releases](https://github.com/9PaiiNz/ssh
 - **Windows:** `.exe` installer (NSIS)
 - **Linux:** `.AppImage` (run `chmod +x *.AppImage` after download)
 
+Linux AppImages are patched to use the host Wayland libraries so they work under Wayland without `LD_PRELOAD`.
+
 To cut a new release, push a version tag:
 
 ```bash

@@ -60,3 +60,22 @@ jobs:
             Built from commit ${{ github.sha }}.
           releaseDraft: false
           prerelease: false
+
+      # AppImage bundles stale libwayland from the CI image, which breaks EGL on
+      # modern Wayland (grey window + EGL_BAD_PARAMETER). Strip them and re-upload.
+      - name: Unbundle Wayland libs from AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          chmod +x scripts/appimage-unbundle-wayland.sh
+          ./scripts/appimage-unbundle-wayland.sh
+
+      - name: Re-upload patched AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          for app in src-tauri/target/release/bundle/appimage/*.AppImage; do
+            echo "Uploading $(basename "$app")"
+            gh release upload "${{ github.ref_name }}" "$app" --clobber
+          done

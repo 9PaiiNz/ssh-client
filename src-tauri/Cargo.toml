@@ -1,6 +1,6 @@
 [package]
 name = "ssh-client"
-version = "0.1.1"
+version = "0.1.2"
 description = "A modern cross-platform SSH client"
 authors = ["timle"]
 edition = "2021"
