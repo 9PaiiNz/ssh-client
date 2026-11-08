@@ -62,6 +62,10 @@ for APP in "${APPIMAGES[@]}"; do
     echo "$REMOVED" | sed 's/^/    removed /'
   fi
 
+  # --appimage-extract leaves dirs at 0700; newer appimagetool refuses to pack
+  # an AppDir that other users can't read, so normalize permissions first.
+  chmod -R a+rX "$EXTRACT_DIR/squashfs-root"
+
   ARCH="$ARCH" "$APPIMAGETOOL" --appimage-extract-and-run \
     "$EXTRACT_DIR/squashfs-root" "$APP.new" >/dev/null
   mv -f "$APP.new" "$APP"
