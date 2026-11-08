@@ -57,20 +57,11 @@ export function Sidebar({ onNewConnection, onEditConnection }: SidebarProps) {
   };
 
   const handleConnect = async (profile: ConnectionProfile) => {
-    await openSession(
-      {
-        profileId: profile.id,
-        host: profile.host,
-        port: profile.port,
-        username: profile.username,
-        authType: profile.auth.type,
-        password: profile.auth.password,
-        keyPath: profile.auth.keyPath,
-        keyPassphrase: profile.auth.keyPassphrase,
-      },
-      profile.name,
-      profile.id
-    );
+    try {
+      await openSession(profile);
+    } catch {
+      // The error is shown in the session tab.
+    }
   };
 
   return (

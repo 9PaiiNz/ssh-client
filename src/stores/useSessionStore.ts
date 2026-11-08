@@ -1,10 +1,30 @@
 import { create } from "zustand";
-import type { SessionTab, TransferProgress } from "@/lib/types";
-import {
-  connectSsh,
-  disconnectSsh,
-  type ConnectParams,
-} from "@/lib/api";
+import type {
+  ConnectError,
+  ConnectionProfile,
+  HostKeyInfo,
+  SessionTab,
+  TransferProgress,
+} from "@/lib/types";
+import { connectSsh, disconnectSsh, trustHostKey } from "@/lib/api";
+
+export interface HostKeyPrompt {
+  info: HostKeyInfo;
+  /** True if the host presented a different key than the one on record. */
+  changed: boolean;
+  profile: ConnectionProfile;
+}
+
+function errorMessage(err: unknown): string {
+  if (err && typeof err === "object" && "kind" in err) {
+    const e = err as ConnectError;
+    if (e.kind === "other") return e.message;
+    return e.kind === "hostKeyChanged"
+      ? `Host key for ${e.host} has changed`
+      : `Unknown host key for ${e.host}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
 
 interface SessionStore {
   tabs: SessionTab[];
@@ -17,7 +37,11 @@ interface SessionStore {
   setSftpOpen: (open: boolean) => void;
   setPortForwardOpen: (open: boolean) => void;
   setActiveTab: (id: string) => void;
-  openSession: (params: ConnectParams, title?: string, profileId?: string) => Promise<string>;
+  hostKeyPrompt: HostKeyPrompt | null;
+  /** Connect to a saved profile. Resolves to null if the user must first confirm the host key. */
+  openSession: (profile: ConnectionProfile) => Promise<string | null>;
+  /** Answer the host key prompt: trust the key and connect, or cancel. */
+  resolveHostKeyPrompt: (trust: boolean) => Promise<void>;
   closeTab: (id: string) => Promise<void>;
   updateTabStatus: (
     id: string,
@@ -39,15 +63,16 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   setSftpOpen: (open) => set({ sftpOpen: open }),
   setPortForwardOpen: (open) => set({ portForwardOpen: open }),
   setActiveTab: (id) => set({ activeTabId: id }),
-  openSession: async (params, title, profileId) => {
+  hostKeyPrompt: null,
+  openSession: async (profile) => {
     const tabId = crypto.randomUUID();
     const tab: SessionTab = {
       id: tabId,
-      profileId,
-      title: title ?? `${params.username}@${params.host}`,
-      host: params.host,
-      port: params.port,
-      username: params.username,
+      profileId: profile.id,
+      title: profile.name || `${profile.username}@${profile.host}`,
+      host: profile.host,
+      port: profile.port,
+      username: profile.username,
       status: "connecting",
     };
     set((state) => ({
@@ -56,7 +81,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }));
 
     try {
-      const sessionId = await connectSsh(params);
+      const sessionId = await connectSsh(profile.id);
       set((state) => ({
         tabs: state.tabs.map((t) =>
           t.id === tabId
@@ -67,14 +92,40 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       }));
       return sessionId;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const e = err as ConnectError;
+      if (e && (e.kind === "unknownHostKey" || e.kind === "hostKeyChanged")) {
+        // Drop the placeholder tab; it is reopened if the user trusts the key.
+        const remaining = get().tabs.filter((t) => t.id !== tabId);
+        set((state) => ({
+          tabs: remaining,
+          activeTabId:
+            state.activeTabId === tabId
+              ? (remaining[remaining.length - 1]?.id ?? null)
+              : state.activeTabId,
+          hostKeyPrompt: {
+            info: e,
+            changed: e.kind === "hostKeyChanged",
+            profile,
+          },
+        }));
+        return null;
+      }
+      const message = errorMessage(err);
       set((state) => ({
         tabs: state.tabs.map((t) =>
           t.id === tabId ? { ...t, status: "error", error: message } : t
         ),
       }));
-      throw err;
+      throw new Error(message);
     }
+  },
+  resolveHostKeyPrompt: async (trust) => {
+    const prompt = get().hostKeyPrompt;
+    set({ hostKeyPrompt: null });
+    if (!prompt || !trust) return;
+    const { info, changed, profile } = prompt;
+    await trustHostKey(info.host, info.port, info.key, changed);
+    await get().openSession(profile);
   },
   closeTab: async (id) => {
     try {

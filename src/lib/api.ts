@@ -19,19 +19,23 @@ export async function deleteProfile(id: string): Promise<void> {
   return invoke("delete_profile", { id });
 }
 
-export interface ConnectParams {
-  profileId?: string;
-  host: string;
-  port: number;
-  username: string;
-  authType: "password" | "key";
-  password?: string;
-  keyPath?: string;
-  keyPassphrase?: string;
+export async function keychainAvailable(): Promise<boolean> {
+  return invoke("keychain_available");
 }
 
-export async function connectSsh(params: ConnectParams): Promise<string> {
-  return invoke("connect_ssh", { params });
+/** Connect using a saved profile; rejects with a ConnectError. */
+export async function connectSsh(profileId: string): Promise<string> {
+  return invoke("connect_ssh", { profileId });
+}
+
+/** Trust a server host key the user confirmed. `replace` drops old keys for the host. */
+export async function trustHostKey(
+  host: string,
+  port: number,
+  key: string,
+  replace: boolean
+): Promise<void> {
+  return invoke("trust_host_key", { host, port, key, replace });
 }
 
 export async function disconnectSsh(sessionId: string): Promise<void> {

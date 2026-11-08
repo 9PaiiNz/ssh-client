@@ -7,11 +7,31 @@ export interface ConnectionProfile {
   username: string;
   auth: {
     type: "password" | "key";
+    /** Write-only: sent when saving; never returned by listProfiles. */
     password?: string;
     keyPath?: string;
+    /** Write-only: sent when saving; never returned by listProfiles. */
     keyPassphrase?: string;
+    /** Set by the backend when a password / passphrase is saved. */
+    hasPassword?: boolean;
+    hasPassphrase?: boolean;
   };
 }
+
+export interface HostKeyInfo {
+  host: string;
+  port: number;
+  keyType: string;
+  fingerprint: string;
+  /** OpenSSH-encoded public key, passed back to trustHostKey. */
+  key: string;
+}
+
+/** Error thrown by connectSsh. */
+export type ConnectError =
+  | ({ kind: "unknownHostKey" } & HostKeyInfo)
+  | ({ kind: "hostKeyChanged" } & HostKeyInfo)
+  | { kind: "other"; message: string };
 
 export interface SessionTab {
   id: string;

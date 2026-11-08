@@ -1,38 +1,90 @@
+mod fsutil;
 mod models;
 mod profiles;
 mod ssh;
 
 use std::sync::Arc;
 
-use models::{ConnectParams, ConnectionProfile, PortForwardRule, SftpEntry};
+use anyhow::anyhow;
+use models::{ConnectError, ConnectionProfile, PortForwardRule, SftpEntry};
 use profiles::ProfileStore;
 use ssh::SessionManager;
 use tauri::Manager;
 
-#[tauri::command]
-fn list_profiles(state: tauri::State<'_, Arc<ProfileStore>>) -> Result<Vec<ConnectionProfile>, String> {
-    state.list().map_err(|e| e.to_string())
+/// Run blocking work (profile file + OS keychain, which may show an unlock
+/// prompt) on a plain thread, outside both the UI thread and the Tokio
+/// runtime. The Linux Secret Service client runs its own executor and must
+/// not be nested inside Tokio.
+async fn off_thread<T, F>(f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.await.map_err(|_| anyhow!("background task failed"))?
 }
 
 #[tauri::command]
-fn save_profile(
+async fn list_profiles(
+    state: tauri::State<'_, Arc<ProfileStore>>,
+) -> Result<Vec<ConnectionProfile>, String> {
+    let store = state.inner().clone();
+    off_thread(move || store.list()).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn save_profile(
     state: tauri::State<'_, Arc<ProfileStore>>,
     profile: ConnectionProfile,
 ) -> Result<(), String> {
-    state.save(&profile).map_err(|e| e.to_string())
+    let store = state.inner().clone();
+    off_thread(move || store.save(profile)).await.map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
-fn delete_profile(state: tauri::State<'_, Arc<ProfileStore>>, id: String) -> Result<(), String> {
-    state.delete(&id).map_err(|e| e.to_string())
+async fn delete_profile(
+    state: tauri::State<'_, Arc<ProfileStore>>,
+    id: String,
+) -> Result<(), String> {
+    let store = state.inner().clone();
+    off_thread(move || store.delete(&id)).await.map_err(|e| format!("{e:#}"))
 }
 
+/// Whether passwords are stored in the OS keychain (true) or fall back to
+/// an owner-only file (false).
+#[tauri::command]
+async fn keychain_available(state: tauri::State<'_, Arc<ProfileStore>>) -> Result<bool, String> {
+    let store = state.inner().clone();
+    off_thread(move || Ok(store.keychain_available())).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Connect using a saved profile. Host, credentials and secrets are read
+/// from the profile store, so the frontend never handles saved secrets.
 #[tauri::command]
 async fn connect_ssh(
+    profiles: tauri::State<'_, Arc<ProfileStore>>,
     sessions: tauri::State<'_, Arc<SessionManager>>,
-    params: ConnectParams,
-) -> Result<String, String> {
-    sessions.connect(params).await.map_err(|e| e.to_string())
+    profile_id: String,
+) -> Result<String, ConnectError> {
+    let store = profiles.inner().clone();
+    let params = off_thread(move || store.resolve(&profile_id)).await?;
+    sessions.connect(params).await
+}
+
+#[tauri::command]
+fn trust_host_key(
+    sessions: tauri::State<'_, Arc<SessionManager>>,
+    host: String,
+    port: u16,
+    key: String,
+    replace: bool,
+) -> Result<(), String> {
+    sessions
+        .trust_host_key(&host, port, &key, replace)
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -156,14 +208,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let profile_store = Arc::new(
                 ProfileStore::new(app.handle()).map_err(|e| e.to_string())?,
             );
             app.manage(profile_store);
 
-            let session_manager = Arc::new(SessionManager::new(app.handle().clone()));
+            let known_hosts_path = app.path().app_data_dir()?.join("known_hosts");
+            let session_manager =
+                Arc::new(SessionManager::new(app.handle().clone(), known_hosts_path));
             app.manage(session_manager);
 
             Ok(())
@@ -172,7 +225,9 @@ pub fn run() {
             list_profiles,
             save_profile,
             delete_profile,
+            keychain_available,
             connect_ssh,
+            trust_host_key,
             disconnect_ssh,
             write_terminal,
             resize_terminal,

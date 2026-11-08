@@ -13,6 +13,7 @@ import { TabBar } from "@/components/layout/TabBar";
 import { StatusBar } from "@/components/layout/StatusBar";
 import { TerminalView } from "@/components/terminal/TerminalView";
 import { ConnectionDialog } from "@/components/connections/ConnectionDialog";
+import { HostKeyDialog } from "@/components/connections/HostKeyDialog";
 import { SftpDrawer } from "@/components/sftp/SftpDrawer";
 import { PortForwardPanel } from "@/components/portforward/PortForwardPanel";
 import type { ConnectionProfile } from "@/lib/types";
@@ -177,6 +178,7 @@ export function AppShell() {
         onOpenChange={setDialogOpen}
         editProfile={editProfile}
       />
+      <HostKeyDialog />
     </div>
   );
 }

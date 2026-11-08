@@ -1,4 +1,5 @@
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use parking_lot::Mutex as ParkingMutex;
 use russh::client;
+use russh::keys::PublicKey;
 use russh::{Channel, ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession as RusshSftpSession;
 use tauri::{AppHandle, Emitter};
@@ -16,12 +18,14 @@ use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 use crate::models::{
-    ConnectParams, PortForwardRule, SessionStatusEvent, SftpEntry, TransferProgress,
+    ConnectError, ConnectParams, PortForwardRule, ResolvedAuth, SessionStatusEvent, SftpEntry,
+    TransferProgress,
 };
 use crate::ssh::client::{
     authenticate_with_key, authenticate_with_password, decode_channel_data, load_private_key,
-    SshClientHandler,
+    HostKeyRejection, SshClientHandler,
 };
+use crate::ssh::known_hosts::KnownHosts;
 
 struct SessionInner {
     handle: Arc<Mutex<client::Handle<SshClientHandler>>>,
@@ -39,18 +43,26 @@ struct PortForwardHandle {
 
 pub struct SessionManager {
     sessions: DashMap<String, Arc<SessionInner>>,
+    known_hosts: Arc<KnownHosts>,
     app: AppHandle,
 }
 
 impl SessionManager {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(app: AppHandle, known_hosts_path: PathBuf) -> Self {
         Self {
             sessions: DashMap::new(),
+            known_hosts: Arc::new(KnownHosts::new(known_hosts_path)),
             app,
         }
     }
 
-    pub async fn connect(&self, params: ConnectParams) -> Result<String> {
+    /// Record a host key the user confirmed in the UI.
+    pub fn trust_host_key(&self, host: &str, port: u16, key: &str, replace: bool) -> Result<()> {
+        let key = PublicKey::from_openssh(key).context("invalid host key")?;
+        self.known_hosts.trust(host, port, &key, replace)
+    }
+
+    pub async fn connect(&self, params: ConnectParams) -> Result<String, ConnectError> {
         let session_id = Uuid::new_v4().to_string();
 
         // Send keepalives so idle sessions aren't dropped by NAT/firewalls or
@@ -62,27 +74,33 @@ impl SessionManager {
             ..Default::default()
         });
 
-        let addr = format!("{}:{}", params.host, params.port);
-        let mut handle = client::connect(config, &addr, SshClientHandler)
-            .await
-            .context("failed to connect to SSH server")?;
+        let rejection = Arc::new(ParkingMutex::new(None));
+        let handler = SshClientHandler::new(
+            params.host.clone(),
+            params.port,
+            self.known_hosts.clone(),
+            rejection.clone(),
+        );
+        let addr = (params.host.as_str(), params.port);
+        let mut handle = match client::connect(config, addr, handler).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                return Err(match rejection.lock().take() {
+                    Some(HostKeyRejection::Unknown(info)) => ConnectError::UnknownHostKey(info),
+                    Some(HostKeyRejection::Changed(info)) => ConnectError::HostKeyChanged(info),
+                    None => e.context("failed to connect to SSH server").into(),
+                });
+            }
+        };
 
-        if params.auth_type == "key" {
-            let key_path = params
-                .key_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| anyhow!("key path required"))?;
-            let key = load_private_key(key_path, params.key_passphrase.as_deref())?;
-            authenticate_with_key(&mut handle, &params.username, key).await?;
-        } else {
-            authenticate_with_password(
-                &mut handle,
-                &params.username,
-                params.password.as_deref().unwrap_or(""),
-            )
-            .await?;
+        match &params.auth {
+            ResolvedAuth::Key { path, passphrase } => {
+                let key = load_private_key(path, passphrase.as_deref())?;
+                authenticate_with_key(&mut handle, &params.username, key).await?;
+            }
+            ResolvedAuth::Password(password) => {
+                authenticate_with_password(&mut handle, &params.username, password).await?;
+            }
         }
 
         let channel = handle
@@ -592,7 +610,7 @@ async fn run_remote_forward(
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     {
-        let mut handle = handle.lock().await;
+        let handle = handle.lock().await;
         handle
             .tcpip_forward(&bind_host, bind_port as u32)
             .await
