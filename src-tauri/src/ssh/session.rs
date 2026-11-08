@@ -53,8 +53,12 @@ impl SessionManager {
     pub async fn connect(&self, params: ConnectParams) -> Result<String> {
         let session_id = Uuid::new_v4().to_string();
 
+        // Send keepalives so idle sessions aren't dropped by NAT/firewalls or
+        // server idle timers; treat the server as dead after 3 missed replies.
         let config = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_secs(3600)),
+            inactivity_timeout: None,
+            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_max: 3,
             ..Default::default()
         });
 
