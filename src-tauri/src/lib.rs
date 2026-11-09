@@ -157,17 +157,45 @@ async fn download_sftp_file(
         .map_err(|e| e.to_string())
 }
 
+/// Download a remote folder with its contents into the local folder `local_dir`.
 #[tauri::command]
-async fn upload_sftp_file(
+async fn download_sftp_dir(
     sessions: tauri::State<'_, Arc<SessionManager>>,
     session_id: String,
-    local_path: String,
     remote_path: String,
+    local_dir: String,
 ) -> Result<String, String> {
     sessions
-        .upload_file(&session_id, &local_path, &remote_path)
+        .download_dir(&session_id, &remote_path, &local_dir)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Delete a remote file or folder (with everything in it).
+#[tauri::command]
+async fn delete_sftp_path(
+    sessions: tauri::State<'_, Arc<SessionManager>>,
+    session_id: String,
+    path: String,
+) -> Result<usize, String> {
+    sessions
+        .delete_path(&session_id, &path)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Upload local files and folders (recursively) into the remote folder `remote_dir`.
+#[tauri::command]
+async fn upload_sftp_paths(
+    sessions: tauri::State<'_, Arc<SessionManager>>,
+    session_id: String,
+    local_paths: Vec<String>,
+    remote_dir: String,
+) -> Result<(), String> {
+    sessions
+        .upload_paths(&session_id, &local_paths, &remote_dir)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -310,7 +338,9 @@ pub fn run() {
             resize_terminal,
             list_sftp_dir,
             download_sftp_file,
-            upload_sftp_file,
+            download_sftp_dir,
+            upload_sftp_paths,
+            delete_sftp_path,
             list_port_forwards,
             add_port_forward,
             remove_port_forward,

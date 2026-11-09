@@ -73,12 +73,30 @@ export async function downloadSftpFile(
   return invoke("download_sftp_file", { sessionId, remotePath, localPath });
 }
 
-export async function uploadSftpFile(
+/** Download a remote folder recursively into `localDir`; resolves to the created folder. */
+export async function downloadSftpDir(
   sessionId: string,
-  localPath: string,
-  remotePath: string
+  remotePath: string,
+  localDir: string
 ): Promise<string> {
-  return invoke("upload_sftp_file", { sessionId, localPath, remotePath });
+  return invoke("download_sftp_dir", { sessionId, remotePath, localDir });
+}
+
+/** Upload local files and folders (recursively) into the remote folder `remoteDir`. */
+export async function uploadSftpPaths(
+  sessionId: string,
+  localPaths: string[],
+  remoteDir: string
+): Promise<void> {
+  return invoke("upload_sftp_paths", { sessionId, localPaths, remoteDir });
+}
+
+/** Delete a remote file or folder (recursively); resolves to the number of removed entries. */
+export async function deleteSftpPath(
+  sessionId: string,
+  path: string
+): Promise<number> {
+  return invoke("delete_sftp_path", { sessionId, path });
 }
 
 export async function listPortForwards(

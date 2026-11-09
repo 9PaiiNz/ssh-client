@@ -50,6 +50,8 @@ interface SessionStore {
   ) => void;
   addTransfer: (transfer: TransferProgress) => void;
   updateTransfer: (transfer: TransferProgress) => void;
+  /** Remove a session's finished (completed or failed) transfers from the list. */
+  clearFinishedTransfers: (sessionId: string) => void;
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -167,6 +169,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     set((state) => ({
       transfers: state.transfers.map((t) =>
         t.transferId === transfer.transferId ? transfer : t
+      ),
+    })),
+  clearFinishedTransfers: (sessionId) =>
+    set((state) => ({
+      transfers: state.transfers.filter(
+        (t) => t.sessionId !== sessionId || t.status === "in_progress"
       ),
     })),
 }));

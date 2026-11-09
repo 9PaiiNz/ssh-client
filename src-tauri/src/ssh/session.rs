@@ -1,5 +1,5 @@
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,6 @@ use russh::keys::PublicKey;
 use russh::{Channel, ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession as RusshSftpSession;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio::sync::{mpsc, Mutex};
@@ -27,12 +26,13 @@ use crate::ssh::client::{
     HostKeyRejection, SshClientHandler,
 };
 use crate::ssh::known_hosts::KnownHosts;
+use crate::ssh::transfer::{self, base_name, Transfer};
 
 struct SessionInner {
     handle: Arc<Mutex<client::Handle<SshClientHandler>>>,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     resize_tx: mpsc::UnboundedSender<(u32, u32)>,
-    sftp: Mutex<Option<RusshSftpSession>>,
+    sftp: Mutex<Option<Arc<RusshSftpSession>>>,
     port_forwards: ParkingMutex<Vec<PortForwardHandle>>,
     cancel: tokio::sync::watch::Sender<bool>,
     log: Arc<SessionLog>,
@@ -231,15 +231,18 @@ impl SessionManager {
         Ok(())
     }
 
-    async fn ensure_sftp(&self, session_id: &str) -> Result<Arc<SessionInner>> {
+    /// The session's SFTP client, opened on first use. Requests on it can
+    /// run concurrently, so browsing works while a transfer is running.
+    async fn sftp(&self, session_id: &str) -> Result<Arc<RusshSftpSession>> {
         let inner = self
             .sessions
             .get(session_id)
             .map(|e| e.clone())
             .ok_or_else(|| anyhow!("session not found"))?;
 
-        if inner.sftp.lock().await.is_some() {
-            return Ok(inner);
+        let mut slot = inner.sftp.lock().await;
+        if let Some(sftp) = slot.as_ref() {
+            return Ok(sftp.clone());
         }
 
         let channel = {
@@ -255,18 +258,17 @@ impl SessionManager {
             .await
             .context("failed to request SFTP subsystem")?;
 
-        let sftp = RusshSftpSession::new(channel.into_stream())
-            .await
-            .context("failed to init SFTP")?;
-
-        *inner.sftp.lock().await = Some(sftp);
-        Ok(inner)
+        let sftp = Arc::new(
+            RusshSftpSession::new(channel.into_stream())
+                .await
+                .context("failed to init SFTP")?,
+        );
+        *slot = Some(sftp.clone());
+        Ok(sftp)
     }
 
     pub async fn list_sftp_dir(&self, session_id: &str, path: &str) -> Result<Vec<SftpEntry>> {
-        let inner = self.ensure_sftp(session_id).await?;
-        let sftp = inner.sftp.lock().await;
-        let sftp = sftp.as_ref().ok_or_else(|| anyhow!("SFTP unavailable"))?;
+        let sftp = self.sftp(session_id).await?;
         let read_dir = sftp.read_dir(path).await.context("failed to read dir")?;
 
         let mut entries = Vec::new();
@@ -289,157 +291,75 @@ impl SessionManager {
         Ok(entries)
     }
 
+    fn progress_emitter(&self) -> impl Fn(&TransferProgress) + Send + Sync + 'static {
+        let app = self.app.clone();
+        move |p| {
+            let _ = app.emit("sftp-transfer-progress", p);
+        }
+    }
+
+    /// Download a remote file to `local_path`.
     pub async fn download_file(
         &self,
         session_id: &str,
         remote_path: &str,
         local_path: &str,
     ) -> Result<String> {
-        let transfer_id = Uuid::new_v4().to_string();
-        let file_name = remote_path
-            .rsplit('/')
-            .next()
-            .unwrap_or("file")
-            .to_string();
-
-        let inner = self.ensure_sftp(session_id).await?;
-        let sftp = inner.sftp.lock().await;
-        let sftp = sftp.as_ref().ok_or_else(|| anyhow!("SFTP unavailable"))?;
-
-        let metadata = sftp
-            .metadata(remote_path)
-            .await
-            .context("failed to stat remote file")?;
-        let total = metadata.size.unwrap_or(0);
-
-        self.emit_transfer(TransferProgress {
-            transfer_id: transfer_id.clone(),
-            session_id: session_id.to_string(),
-            file_name: file_name.clone(),
-            direction: "download".to_string(),
-            bytes_transferred: 0,
-            total_bytes: total,
-            status: "in_progress".to_string(),
-            error: None,
-        });
-
-        let mut remote = sftp
-            .open(remote_path)
-            .await
-            .context("failed to open remote file")?;
-        let mut local = tokio::fs::File::create(local_path)
-            .await
-            .context("failed to create local file")?;
-
-        let mut transferred = 0u64;
-        let mut buf = vec![0u8; 32768];
-        loop {
-            let n = remote.read(&mut buf).await.context("read error")?;
-            if n == 0 {
-                break;
-            }
-            local.write_all(&buf[..n]).await.context("write error")?;
-            transferred += n as u64;
-            self.emit_transfer(TransferProgress {
-                transfer_id: transfer_id.clone(),
-                session_id: session_id.to_string(),
-                file_name: file_name.clone(),
-                direction: "download".to_string(),
-                bytes_transferred: transferred,
-                total_bytes: total,
-                status: "in_progress".to_string(),
-                error: None,
-            });
+        let mut t = Transfer::start(self.progress_emitter(), session_id, base_name(remote_path), "download");
+        let result = async {
+            let sftp = self.sftp(session_id).await?;
+            transfer::download_file(&sftp, remote_path, Path::new(local_path), &mut t).await
         }
-
-        self.emit_transfer(TransferProgress {
-            transfer_id,
-            session_id: session_id.to_string(),
-            file_name,
-            direction: "download".to_string(),
-            bytes_transferred: transferred,
-            total_bytes: total,
-            status: "completed".to_string(),
-            error: None,
-        });
-
+        .await;
+        t.finish(result)?;
         Ok(local_path.to_string())
     }
 
-    pub async fn upload_file(
+    /// Download a remote folder recursively into the local folder `local_dir`.
+    /// Returns the path of the created folder.
+    pub async fn download_dir(
         &self,
         session_id: &str,
-        local_path: &str,
         remote_path: &str,
+        local_dir: &str,
     ) -> Result<String> {
-        let transfer_id = Uuid::new_v4().to_string();
-        let file_name = local_path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("file")
-            .to_string();
-
-        let meta = tokio::fs::metadata(local_path)
-            .await
-            .context("failed to stat local file")?;
-        let total = meta.len();
-
-        self.emit_transfer(TransferProgress {
-            transfer_id: transfer_id.clone(),
-            session_id: session_id.to_string(),
-            file_name: file_name.clone(),
-            direction: "upload".to_string(),
-            bytes_transferred: 0,
-            total_bytes: total,
-            status: "in_progress".to_string(),
-            error: None,
-        });
-
-        let inner = self.ensure_sftp(session_id).await?;
-        let sftp = inner.sftp.lock().await;
-        let sftp = sftp.as_ref().ok_or_else(|| anyhow!("SFTP unavailable"))?;
-
-        let mut local = tokio::fs::File::open(local_path)
-            .await
-            .context("failed to open local file")?;
-        let mut remote = sftp
-            .create(remote_path)
-            .await
-            .context("failed to create remote file")?;
-
-        let mut transferred = 0u64;
-        let mut buf = vec![0u8; 32768];
-        loop {
-            let n = local.read(&mut buf).await.context("read error")?;
-            if n == 0 {
-                break;
-            }
-            remote.write_all(&buf[..n]).await.context("write error")?;
-            transferred += n as u64;
-            self.emit_transfer(TransferProgress {
-                transfer_id: transfer_id.clone(),
-                session_id: session_id.to_string(),
-                file_name: file_name.clone(),
-                direction: "upload".to_string(),
-                bytes_transferred: transferred,
-                total_bytes: total,
-                status: "in_progress".to_string(),
-                error: None,
-            });
+        let mut t = Transfer::start(self.progress_emitter(), session_id, base_name(remote_path), "download");
+        let result = async {
+            let sftp = self.sftp(session_id).await?;
+            transfer::download_dir(&sftp, remote_path, Path::new(local_dir), &mut t).await
         }
+        .await;
+        let root = t.finish(result)?;
+        Ok(root.to_string_lossy().into_owned())
+    }
 
-        self.emit_transfer(TransferProgress {
-            transfer_id,
-            session_id: session_id.to_string(),
-            file_name,
-            direction: "upload".to_string(),
-            bytes_transferred: transferred,
-            total_bytes: total,
-            status: "completed".to_string(),
-            error: None,
-        });
+    /// Delete a remote file or folder (recursively).
+    pub async fn delete_path(&self, session_id: &str, path: &str) -> Result<usize> {
+        let sftp = self.sftp(session_id).await?;
+        transfer::delete(&sftp, path).await
+    }
 
-        Ok(remote_path.to_string())
+    /// Upload local files and folders into `remote_dir`, one transfer each.
+    /// Returns the first error after trying all of them.
+    pub async fn upload_paths(
+        &self,
+        session_id: &str,
+        local_paths: &[String],
+        remote_dir: &str,
+    ) -> Result<()> {
+        let mut first_err = None;
+        for local in local_paths {
+            let mut t = Transfer::start(self.progress_emitter(), session_id, base_name(local), "upload");
+            let result = async {
+                let sftp = self.sftp(session_id).await?;
+                transfer::upload(&sftp, Path::new(local), remote_dir, &mut t).await
+            }
+            .await;
+            if let Err(e) = t.finish(result) {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     pub async fn add_port_forward(
@@ -532,10 +452,6 @@ impl SessionManager {
             }
         }
         Ok(())
-    }
-
-    fn emit_transfer(&self, progress: TransferProgress) {
-        let _ = self.app.emit("sftp-transfer-progress", &progress);
     }
 }
 
