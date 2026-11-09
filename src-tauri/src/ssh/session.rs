@@ -17,6 +17,7 @@ use tokio::net::TcpStream as TokioTcpStream;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
+use crate::history::{EndReason, History, SessionLog, Utf8Stream};
 use crate::models::{
     ConnectError, ConnectParams, PortForwardRule, ResolvedAuth, SessionStatusEvent, SftpEntry,
     TransferProgress,
@@ -34,6 +35,7 @@ struct SessionInner {
     sftp: Mutex<Option<RusshSftpSession>>,
     port_forwards: ParkingMutex<Vec<PortForwardHandle>>,
     cancel: tokio::sync::watch::Sender<bool>,
+    log: Arc<SessionLog>,
 }
 
 struct PortForwardHandle {
@@ -44,15 +46,49 @@ struct PortForwardHandle {
 pub struct SessionManager {
     sessions: DashMap<String, Arc<SessionInner>>,
     known_hosts: Arc<KnownHosts>,
+    history: Arc<History>,
     app: AppHandle,
 }
 
+/// Payload of `terminal-output:<session id>` events.
+#[derive(Clone, serde::Serialize)]
+pub struct TerminalOutput {
+    /// Stream position after this chunk (see [`SessionManager::scrollback`]).
+    pub seq: u64,
+    pub data: String,
+}
+
+/// Recent output of a session and the stream position it ends at.
+#[derive(serde::Serialize)]
+pub struct ScrollbackSnapshot {
+    pub seq: u64,
+    pub data: String,
+}
+
 impl SessionManager {
-    pub fn new(app: AppHandle, known_hosts_path: PathBuf) -> Self {
+    pub fn new(app: AppHandle, known_hosts_path: PathBuf, history: Arc<History>) -> Self {
         Self {
             sessions: DashMap::new(),
             known_hosts: Arc::new(KnownHosts::new(known_hosts_path)),
+            history,
             app,
+        }
+    }
+
+    /// Recent output of a live (or ended but not yet closed) session.
+    pub fn scrollback(&self, session_id: &str) -> Result<ScrollbackSnapshot> {
+        let inner = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session not found"))?;
+        let (data, seq) = inner.log.scrollback.snapshot();
+        Ok(ScrollbackSnapshot { seq, data })
+    }
+
+    /// Save the output of all open sessions; called when the app exits.
+    pub fn save_all_history(&self) {
+        for entry in self.sessions.iter() {
+            entry.log.save(EndReason::AppExit);
         }
     }
 
@@ -123,6 +159,13 @@ impl SessionManager {
         let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u32, u32)>();
 
         let handle = Arc::new(Mutex::new(handle));
+        let log = Arc::new(SessionLog::new(
+            self.history.clone(),
+            params.profile_id.clone(),
+            params.host.clone(),
+            params.port,
+            params.username.clone(),
+        ));
 
         let inner = Arc::new(SessionInner {
             handle: handle.clone(),
@@ -131,6 +174,7 @@ impl SessionManager {
             sftp: Mutex::new(None),
             port_forwards: ParkingMutex::new(Vec::new()),
             cancel: cancel_tx,
+            log: log.clone(),
         });
 
         self.sessions.insert(session_id.clone(), inner.clone());
@@ -138,7 +182,8 @@ impl SessionManager {
         let app = self.app.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
-            shell_loop(app, sid, channel, write_rx, resize_rx, cancel_rx).await;
+            let reason = shell_loop(&app, &sid, &log, channel, write_rx, resize_rx, cancel_rx).await;
+            let _ = tokio::task::spawn_blocking(move || log.save(reason)).await;
         });
 
         Ok(session_id)
@@ -147,6 +192,10 @@ impl SessionManager {
     pub async fn disconnect(&self, session_id: &str) -> Result<()> {
         if let Some((_, inner)) = self.sessions.remove(session_id) {
             let _ = inner.cancel.send(true);
+            // Save now rather than when the shell task notices the cancel,
+            // so reconnecting right away already shows this session.
+            let log = inner.log.clone();
+            let _ = tokio::task::spawn_blocking(move || log.save(EndReason::Closed)).await;
             for pf in inner.port_forwards.lock().drain(..) {
                 pf.task.abort();
             }
@@ -490,28 +539,41 @@ impl SessionManager {
     }
 }
 
+/// Pump terminal I/O until the session ends; returns why it ended.
 async fn shell_loop(
-    app: AppHandle,
-    session_id: String,
+    app: &AppHandle,
+    session_id: &str,
+    log: &SessionLog,
     mut channel: Channel<client::Msg>,
     mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut resize_rx: mpsc::UnboundedReceiver<(u32, u32)>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
-) {
-    loop {
+) -> EndReason {
+    let output_event = format!("terminal-output:{session_id}");
+    let mut decoder = Utf8Stream::default();
+    let emit_output = |decoder: &mut Utf8Stream, data: &[u8]| {
+        let text = decoder.decode(data);
+        if text.is_empty() {
+            return;
+        }
+        let seq = log.scrollback.push(&text);
+        let _ = app.emit(&output_event, TerminalOutput { seq, data: text });
+    };
+
+    let reason = loop {
         if *cancel.borrow() {
-            break;
+            break EndReason::Closed;
         }
 
         tokio::select! {
             _ = cancel.changed() => {
                 if *cancel.borrow() {
-                    break;
+                    break EndReason::Closed;
                 }
             }
             Some(data) = write_rx.recv() => {
                 if channel.data(&data[..]).await.is_err() {
-                    break;
+                    break EndReason::Disconnected;
                 }
             }
             Some((cols, rows)) = resize_rx.recv() => {
@@ -519,33 +581,32 @@ async fn shell_loop(
             }
             msg = channel.wait() => {
                 match msg {
-                    Some(ChannelMsg::Data { data }) => {
-                        let text = String::from_utf8_lossy(&data).to_string();
-                        let _ = app.emit(&format!("terminal-output:{}", session_id), text);
-                    }
+                    Some(ChannelMsg::Data { data }) => emit_output(&mut decoder, &data),
                     Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::Eof) | None => {
-                        let _ = app.emit(
-                            &format!("session-status:{}", session_id),
-                            SessionStatusEvent {
-                                status: "disconnected".to_string(),
-                                error: None,
-                            },
-                        );
-                        break;
+                        break EndReason::Disconnected;
                     }
                     Some(other) => {
                         if let Some(data) = decode_channel_data(other) {
-                            let text = String::from_utf8_lossy(&data).to_string();
-                            let _ = app.emit(&format!("terminal-output:{}", session_id), text);
+                            emit_output(&mut decoder, &data);
                         }
                     }
                 }
             }
         }
-    }
+    };
 
+    if reason == EndReason::Disconnected {
+        let _ = app.emit(
+            &format!("session-status:{session_id}"),
+            SessionStatusEvent {
+                status: "disconnected".to_string(),
+                error: None,
+            },
+        );
+    }
     let _ = channel.eof().await;
     let _ = channel.close().await;
+    reason
 }
 
 async fn run_local_forward(

@@ -1,4 +1,5 @@
 mod fsutil;
+mod history;
 mod models;
 mod profiles;
 mod ssh;
@@ -6,9 +7,10 @@ mod ssh;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use history::{History, HistoryEntry};
 use models::{ConnectError, ConnectionProfile, PortForwardRule, SftpEntry};
 use profiles::ProfileStore;
-use ssh::SessionManager;
+use ssh::{ScrollbackSnapshot, SessionManager};
 use tauri::Manager;
 
 /// Run blocking work (profile file + OS keychain, which may show an unlock
@@ -47,10 +49,20 @@ async fn save_profile(
 #[tauri::command]
 async fn delete_profile(
     state: tauri::State<'_, Arc<ProfileStore>>,
+    history: tauri::State<'_, Arc<History>>,
     id: String,
 ) -> Result<(), String> {
     let store = state.inner().clone();
-    off_thread(move || store.delete(&id)).await.map_err(|e| format!("{e:#}"))
+    let history = history.inner().clone();
+    off_thread(move || {
+        store.delete(&id)?;
+        if let Err(e) = history.delete_profile(&id) {
+            tracing::warn!("failed to delete session history: {e:#}");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// Whether passwords are stored in the OS keychain (true) or fall back to
@@ -201,6 +213,65 @@ async fn remove_port_forward(
         .map_err(|e| e.to_string())
 }
 
+/// Recent output of an open session, to redraw its terminal.
+#[tauri::command]
+fn get_scrollback(
+    sessions: tauri::State<'_, Arc<SessionManager>>,
+    session_id: String,
+) -> Result<ScrollbackSnapshot, String> {
+    sessions.scrollback(&session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_history(
+    history: tauri::State<'_, Arc<History>>,
+    profile_id: String,
+) -> Result<Vec<HistoryEntry>, String> {
+    let history = history.inner().clone();
+    off_thread(move || history.list(&profile_id)).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn read_history(
+    history: tauri::State<'_, Arc<History>>,
+    profile_id: String,
+    entry_id: String,
+) -> Result<String, String> {
+    let history = history.inner().clone();
+    off_thread(move || history.read(&profile_id, &entry_id))
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Delete one saved session, or all of a profile's when `entry_id` is None.
+#[tauri::command]
+async fn delete_history(
+    history: tauri::State<'_, Arc<History>>,
+    profile_id: String,
+    entry_id: Option<String>,
+) -> Result<(), String> {
+    let history = history.inner().clone();
+    off_thread(move || match entry_id {
+        Some(id) => history.delete(&profile_id, &id),
+        None => history.delete_profile(&profile_id),
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn history_enabled(history: tauri::State<'_, Arc<History>>) -> bool {
+    history.enabled()
+}
+
+#[tauri::command]
+fn set_history_enabled(
+    history: tauri::State<'_, Arc<History>>,
+    enabled: bool,
+) -> Result<(), String> {
+    history.set_enabled(enabled).map_err(|e| format!("{e:#}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt::init();
@@ -214,9 +285,15 @@ pub fn run() {
             );
             app.manage(profile_store);
 
-            let known_hosts_path = app.path().app_data_dir()?.join("known_hosts");
-            let session_manager =
-                Arc::new(SessionManager::new(app.handle().clone(), known_hosts_path));
+            let data_dir = app.path().app_data_dir()?;
+            let history = Arc::new(History::new(data_dir.join("history")));
+            app.manage(history.clone());
+
+            let session_manager = Arc::new(SessionManager::new(
+                app.handle().clone(),
+                data_dir.join("known_hosts"),
+                history,
+            ));
             app.manage(session_manager);
 
             Ok(())
@@ -237,7 +314,19 @@ pub fn run() {
             list_port_forwards,
             add_port_forward,
             remove_port_forward,
+            get_scrollback,
+            list_history,
+            read_history,
+            delete_history,
+            history_enabled,
+            set_history_enabled,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Sessions still open when the app closes go to history too.
+            if let tauri::RunEvent::Exit = event {
+                app.state::<Arc<SessionManager>>().save_all_history();
+            }
+        });
 }

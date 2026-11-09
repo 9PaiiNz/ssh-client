@@ -3,12 +3,14 @@ import {
   ChevronDown,
   ChevronRight,
   Folder,
+  History,
   Plus,
   Search,
   Server,
   Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { HistoryDialog } from "@/components/history/HistoryDialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ConnectionProfile } from "@/lib/types";
@@ -25,6 +27,7 @@ export function Sidebar({ onNewConnection, onEditConnection }: SidebarProps) {
   const openSession = useSessionStore((s) => s.openSession);
   const [search, setSearch] = useState("");
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [historyProfile, setHistoryProfile] = useState<ConnectionProfile | null>(null);
 
   useEffect(() => {
     loadProfiles();
@@ -127,6 +130,15 @@ export function Sidebar({ onNewConnection, onEditConnection }: SidebarProps) {
                         variant="ghost"
                         size="icon"
                         className="h-6 w-6"
+                        title="Session history"
+                        onClick={() => setHistoryProfile(profile)}
+                      >
+                        <History className="h-3 w-3" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6"
                         onClick={() => onEditConnection(profile)}
                       >
                         <span className="text-[10px]">✎</span>
@@ -151,6 +163,11 @@ export function Sidebar({ onNewConnection, onEditConnection }: SidebarProps) {
           )}
         </div>
       </ScrollArea>
+
+      <HistoryDialog
+        profile={historyProfile}
+        onOpenChange={(open) => !open && setHistoryProfile(null)}
+      />
     </div>
   );
 }

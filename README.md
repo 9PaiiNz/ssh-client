@@ -8,6 +8,7 @@ A modern, clean cross-platform SSH client built with Tauri 2 and React. Terminal
 - **Tabbed terminal sessions** — Multiple concurrent SSH sessions with xterm.js
 - **SFTP file browser** — Browse, upload, and download files via a slide-out drawer
 - **Port forwarding** — Local and remote TCP port forwarding per session
+- **Session history** — The terminal output of your last 10 sessions per host is saved when a session ends (click the history icon next to a host); can be turned off
 - **Cross-platform** — Windows and Linux support
 - **Host key verification** — Asks you to confirm a server's fingerprint on first connect and warns if it changes (also honors `~/.ssh/known_hosts`)
 - **Secure password storage** — Saved passwords and key passphrases go to the OS keychain (Windows Credential Manager, or GNOME Keyring / KWallet on Linux); without a keychain they fall back to a file only your user can read

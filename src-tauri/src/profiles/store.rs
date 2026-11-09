@@ -175,6 +175,7 @@ impl ProfileStore {
             }
         };
         Ok(ConnectParams {
+            profile_id: profile.id,
             host: profile.host,
             port: profile.port,
             username: profile.username,

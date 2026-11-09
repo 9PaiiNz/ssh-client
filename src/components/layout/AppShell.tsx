@@ -120,18 +120,33 @@ export function AppShell() {
 
           <div className="flex flex-1 min-h-0">
             <div className="flex-1 min-w-0">
+              {/* Terminals stay mounted while their tab is in the background,
+                  so they keep their content and keep receiving output. */}
+              {tabs
+                .filter((t) => t.status === "connected" || t.status === "disconnected")
+                .map((t) => (
+                  <div
+                    key={t.id}
+                    className={t.id === activeTabId ? "h-full" : "hidden"}
+                  >
+                    <TerminalView
+                      sessionId={t.id}
+                      profileId={t.profileId}
+                      active={t.id === activeTabId}
+                    />
+                  </div>
+                ))}
               {activeTab ? (
-                activeTab.status === "connecting" ? (
+                activeTab.status === "connected" ||
+                activeTab.status === "disconnected" ? null : activeTab.status === "connecting" ? (
                   <div className="flex h-full items-center justify-center text-muted text-sm">
                     Connecting to {activeTab.title}...
                   </div>
-                ) : activeTab.status === "error" ? (
+                ) : (
                   <div className="flex h-full flex-col items-center justify-center gap-2 text-muted">
                     <p className="text-danger text-sm">{activeTab.error}</p>
                     <p className="text-xs">Close this tab and try again</p>
                   </div>
-                ) : (
-                  <TerminalView sessionId={activeTab.id} />
                 )
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-4 text-muted">

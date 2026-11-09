@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionProfile,
+  HistoryEntry,
   PortForwardRule,
   SftpEntry,
   TransferProgress,
@@ -111,13 +112,52 @@ export async function removePortForward(
   return invoke("remove_port_forward", { sessionId, ruleId });
 }
 
+/** A chunk of terminal output; `seq` is the stream position after it. */
+export interface TerminalChunk {
+  seq: number;
+  data: string;
+}
+
 export function onTerminalOutput(
   sessionId: string,
-  handler: (data: string) => void
+  handler: (chunk: TerminalChunk) => void
 ): Promise<UnlistenFn> {
-  return listen<string>(`terminal-output:${sessionId}`, (event) => {
+  return listen<TerminalChunk>(`terminal-output:${sessionId}`, (event) => {
     handler(event.payload);
   });
+}
+
+/** Recent output of an open session; `seq` is the stream position it ends at. */
+export async function getScrollback(sessionId: string): Promise<TerminalChunk> {
+  return invoke("get_scrollback", { sessionId });
+}
+
+/** Saved sessions of a profile, newest first. */
+export async function listHistory(profileId: string): Promise<HistoryEntry[]> {
+  return invoke("list_history", { profileId });
+}
+
+export async function readHistory(
+  profileId: string,
+  entryId: string
+): Promise<string> {
+  return invoke("read_history", { profileId, entryId });
+}
+
+/** Delete one saved session, or all of the profile's if `entryId` is omitted. */
+export async function deleteHistory(
+  profileId: string,
+  entryId?: string
+): Promise<void> {
+  return invoke("delete_history", { profileId, entryId: entryId ?? null });
+}
+
+export async function historyEnabled(): Promise<boolean> {
+  return invoke("history_enabled");
+}
+
+export async function setHistoryEnabled(enabled: boolean): Promise<void> {
+  return invoke("set_history_enabled", { enabled });
 }
 
 export function onSessionStatus(

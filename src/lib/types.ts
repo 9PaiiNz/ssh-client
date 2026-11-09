@@ -73,3 +73,17 @@ export interface TransferProgress {
   status: "in_progress" | "completed" | "failed";
   error?: string;
 }
+
+/** A saved terminal output of an ended session. */
+export interface HistoryEntry {
+  id: string;
+  profileId: string;
+  host: string;
+  port: number;
+  username: string;
+  /** Unix time in milliseconds. */
+  startedAt: number;
+  endedAt: number;
+  endReason: "closed" | "disconnected" | "appExit";
+  size: number;
+}

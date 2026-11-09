@@ -86,6 +86,7 @@ fn is_false(b: &bool) -> bool {
 /// saved profile (the frontend only sends the profile id).
 #[derive(Debug, Clone)]
 pub struct ConnectParams {
+    pub profile_id: String,
     pub host: String,
     pub port: u16,
     pub username: String,
