@@ -51,7 +51,13 @@ export function TerminalView({ sessionId, profileId, active }: TerminalViewProps
     const resizeObserver = new ResizeObserver(fitAndResize);
     resizeObserver.observe(container);
 
+    // While old output is replayed, xterm.js answers terminal queries that
+    // are in it (cursor position, colours, device attributes, e.g. from vim).
+    // Those answers come out of onData like keystrokes; drop them so they are
+    // not typed into the new shell. Live output is answered normally.
+    let replaying = true;
     const dataDisposable = terminal.onData((data) => {
+      if (replaying) return;
       writeTerminal(sessionId, data).catch(() => {});
     });
 
@@ -71,23 +77,24 @@ export function TerminalView({ sessionId, profileId, active }: TerminalViewProps
     };
 
     const unlistenOutput = onTerminalOutput(sessionId, writeChunk);
-    unlistenOutput
-      .then(() => drawPreviousSession(terminal, profileId, () => disposed))
-      .then(() => getScrollback(sessionId))
-      .then(
-        (snapshot) => {
-          if (disposed) return;
-          terminal.write(snapshot.data);
-          drawnUpTo = snapshot.seq;
-        },
-        () => {
-          drawnUpTo = 0;
-        }
-      )
-      .finally(() => {
+    const replay = async () => {
+      await unlistenOutput;
+      await drawPreviousSession(terminal, profileId, () => disposed);
+      try {
+        const snapshot = await getScrollback(sessionId);
         if (disposed) return;
-        for (const chunk of queued.splice(0)) writeChunk(chunk);
-      });
+        // Resolves once xterm.js has parsed it, i.e. after any answers.
+        await writeAsync(terminal, snapshot.data);
+        drawnUpTo = snapshot.seq;
+      } catch {
+        drawnUpTo = 0;
+      }
+    };
+    replay().finally(() => {
+      replaying = false;
+      if (disposed) return;
+      for (const chunk of queued.splice(0)) writeChunk(chunk);
+    });
 
     const unlistenStatus = onSessionStatus(sessionId, (status, error) => {
       updateTabStatus(
